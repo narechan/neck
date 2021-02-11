@@ -1,0 +1,593 @@
+#!/usr/bin/perl
+
+use Getopt::Std;
+use Statistics::Descriptive;
+use Parallel::ForkManager;
+use strict;
+
+my %opts = ();
+getopts ('i:o:k:p:c:n:l:m:', \%opts);
+my $indir  = $opts{'i'}; #directory of genomes; sequence should be on a single line
+my $outdir = $opts{'o'}; #directory with output of run
+my $kmer = $opts{'k'}; #kmer size
+my $motion = $opts{'m'}; #defined kmer overlap; m=1 will move kmers along on nuc at time and so on
+my $clustnum = $opts{'c'}; #number of clusters to model
+my $iterations = $opts{'n'}; #number of iterations of the sib clustering procedure
+my $procs = $opts{'p'}; #forks
+my $denslen = $opts{'l'}; #length of the bin for circos density plots
+
+`mkdir -p $outdir`;
+
+# genomes
+opendir (D, "$indir");
+my @genomes = sort (readdir (D));
+shift @genomes;
+shift @genomes;
+closedir (D);
+my $gcount = @genomes;
+
+# kmer counting
+my $fkmers = {};
+my $kmers = {};
+my $tkmers = {};
+my $allkmers = 0;
+my $glens = {};
+my $kmersperg = {};
+
+open (KI, ">$outdir/k.index");
+foreach my $genome (@genomes){
+    print STDERR "Counting $genome\n";
+    my $id;
+    my $seq;
+    my $len;
+    open (FASTA, "$indir/$genome");
+    while (my $line =<FASTA>){
+	if ($line =~m/^>(.*)/){
+	    $id = $1;
+	}
+	else{
+	    $seq = $line;
+	    $len = length ($seq);
+	    $glens->{$genome} += $len;
+	    $allkmers    += $len - $kmer + 1;
+	    $tkmers->{$genome}->{$id} = $len;
+	    $kmersperg->{$genome} += $len - $kmer + 1;
+
+	    my $cnter = 1;
+	    while (length $seq >= $kmer){
+		my $frag = substr $seq, 0, $kmer;
+		unless ($frag =~m/N/){
+		    $kmers->{$frag}->{$genome}++;
+		    $fkmers->{$frag}++;
+		    print KI "$frag\t$genome\t$id\t$cnter\n";
+		}
+		substr $seq, 0, $motion, '';
+		$cnter += $motion;
+	    }
+	}
+    }
+}
+close (KI);
+
+open (MAST, ">$outdir/stats.out");
+my $uniqkmers = keys %$kmers;
+print MAST "uniqkmers=$uniqkmers\n";
+
+# entropy of all the kmers
+my @allkfreqs;
+foreach my $k (keys %$fkmers){
+    push (@allkfreqs, $fkmers->{$k} / $allkmers);
+}
+my $kent = ent (\@allkfreqs);
+
+
+###SIB###
+
+# get MI of the raw data (I(X|Y))
+my $minfo = mi ($kmers, \@genomes, $allkmers);
+print MAST "kMI=$minfo\n";
+
+# print entropy of the kmers (H(X))
+print MAST "kEnt=$kent\n";
+
+# inititalize a random set of clusters
+my $kclust = {};
+my $kit = {};
+my $fkclust = {}; #for genomes
+my $fk2clust = {};#for kmers
+my $ckclust = {};
+foreach my $k (keys %$kmers){
+    my $index = int(rand($clustnum));
+    $kclust->{$k} = $index;
+    $kit->{$index} = 1;
+    my $counter = -1;
+    foreach my $genome (@genomes){
+	$counter++;
+	$fkclust->{$index}->{$genome} += $kmers->{$k}->{$genome};
+	$fk2clust->{$index}->{$k} += $kmers->{$k}->{$genome}; #too much memory?
+	$ckclust->{$index} += $kmers->{$k}->{$genome};
+    }
+}
+
+# output initial distributions
+foreach my $c (sort {$a <=> $b} keys %$fkclust){
+    print STDERR "CLUST$c\t";
+    my @str;
+    foreach my $g (@genomes){
+	push (@str, $fkclust->{$c}->{$g});
+    }
+    my $str = join "\t", @str;
+    print STDERR "$str\n";
+}
+
+# init cluster MI
+my $initclustmi = mi ($fkclust, \@genomes, $allkmers);
+my $norminitclustmi = $initclustmi / $minfo;
+
+# init k MI (compression MI) (I(T|X))
+my @ks = keys %$kmers;
+my $initkmi = mi ($fk2clust, \@ks, $allkmers);
+my $norminitkmi = $initkmi / $kent;
+
+<<<<<<< HEAD
+#print MAST "0\tclustMI=$initclustmi($norminitclustmi)\tkMI=$initkmi($norminitkmi)\n";
+print MAST "0\tclustMI=$initclustmi($norminitclustmi)\n";
+=======
+print MAST "0\tclustMI=$initclustmi($norminitclustmi)\tkMI=$initkmi($norminitkmi)\n";
+>>>>>>> 3388d62adc3a8c01daca28fccdaad3b7c2ad48e8
+
+# short circuit variables
+my $maxloops = 1;
+
+# short circuit loop
+until ($maxloops > $iterations){
+    print STDERR "loop $maxloops\n";
+
+    # kmer loop against all clusters
+    foreach my $k (keys %$kmers){
+
+	# build kmer freqs for JSD
+	my @kfreqs;
+	foreach my $genome (@genomes){
+	    push (@kfreqs, $kmers->{$k}->{$genome} / $fkmers->{$k});
+	}
+
+	my $dmin = 1e6;
+	my $selectclust;
+	my $origclust = $kclust->{$k};
+	
+	foreach my $c (sort {$a <=> $b} keys %$kit){
+	    
+	    # check to see if the cluster has been purged
+	    if ($ckclust->{$c} == 0){
+		next;
+	    }
+
+	    # build cluster freqs for JSD
+	    my @temparray;
+	    foreach my $genome (@genomes){
+		push (@temparray, $fkclust->{$c}->{$genome} / $ckclust->{$c});
+	    }
+	    
+	    # build the weights
+	    my $clustfreq = $ckclust->{$c} / $uniqkmers;
+	    my $kfreq     = $fkmers->{$k} / $uniqkmers;
+	    
+	    # calculate divergence and update min
+	    my $jsd = jsd (\@kfreqs, \@temparray, $kfreq, $clustfreq, $gcount);
+	    my $div = ($kfreq + $clustfreq) * $jsd;
+	    if ($div < $dmin){
+		$dmin = $div;
+		$selectclust = $c;
+	    }
+	    else{
+		next;
+	    }
+	}
+	
+	# move kmer and update vars if its min cluster is different than current
+	if ($selectclust != $origclust){
+	    foreach my $g (@genomes){
+		$fkclust->{$origclust}->{$g} -= $kmers->{$k}->{$g};
+                $fkclust->{$selectclust}->{$g} += $kmers->{$k}->{$g};
+		$fk2clust->{$origclust}->{$k} -= $kmers->{$k}->{$g};
+                $fk2clust->{$selectclust}->{$k} += $kmers->{$k}->{$g};
+		$ckclust->{$origclust} -= $kmers->{$k}->{$g};
+		$ckclust->{$selectclust} += $kmers->{$k}->{$g};
+	    }
+	    $kclust->{$k} = $selectclust;
+	}
+	else{
+	    next;
+	}
+    }
+    
+    # print state of dists
+    foreach my $c (sort {$a <=> $b} keys %$fkclust){
+	print STDERR "CLUST$c\t";
+	my @str;
+	foreach my $g (@genomes){
+	    push (@str, $fkclust->{$c}->{$g});
+	}
+	my $str = join "\t", @str;
+	print STDERR "$str\n";
+    }
+    
+    # calculate clust MI (I(T|Y))
+    my $clustmi = mi ($fkclust, \@genomes, $allkmers);
+    my $normclustmi = $clustmi / $minfo;
+
+    # calculate k MI (compression MI) (I(T|X))
+    my @ks = keys %$kmers;
+    my $kmi = mi ($fk2clust, \@ks, $allkmers); 
+    my $normkmi = $kmi / $kent;
+
+<<<<<<< HEAD
+#    print MAST "$maxloops\tclustMI=$clustmi($normclustmi)\tkMI=$kmi($normkmi)\n";
+    print MAST "$maxloops\tclustMI=$clustmi($normclustmi)\n";
+=======
+    print MAST "$maxloops\tclustMI=$clustmi($normclustmi)\tkMI=$kmi($normkmi)\n";
+>>>>>>> 3388d62adc3a8c01daca28fccdaad3b7c2ad48e8
+    $maxloops++;
+}
+
+# find the core cluster: the cluster with the highest mean
+# and lowest variance by rank
+print STDERR "Finding the core\n";
+my $coremeans = {};
+my $coredisp = {};
+my $crank = {};
+foreach my $c (sort {$a <=> $b} keys %$fkclust){
+    $crank->{$c} = 0;
+    my @str;
+    foreach my $g (@genomes){
+	push (@str, $fkclust->{$c}->{$g});
+    }
+    my $statobj = Statistics::Descriptive::Full->new();
+    $statobj->add_data(@str);
+    my $mean  = $statobj->mean();
+    my $variance = $statobj->variance();
+
+    # don't consider this cluster if it's all zeros
+    next if ($mean == 0);
+
+    $coremeans->{$c} = $mean;
+    $coredisp->{$c} = $variance / $mean;
+}
+
+# rank means
+my $counter = 0;
+foreach my $c (sort {$coremeans->{$b} <=> $coremeans->{$a}} keys %$coremeans){
+    $counter++;
+    $crank->{$c} += $counter;
+}
+
+# rank dispersions
+my $counter = 0;
+foreach my $c (sort {$coredisp->{$a} <=> $coredisp->{$b}} keys %$coredisp){
+    $counter++;
+    $crank->{$c} += $counter;
+}
+
+my $corecl = 0;
+my $corem = 0;
+my $cored = 0;
+foreach my $c (sort {$crank->{$a} <=> $crank->{$b}} keys %$crank){
+    $corecl = $c;
+    $corem = $coremeans->{$c};
+    $cored = $coredisp->{$c};
+    last;
+}
+
+# print out the kmer cluster fasta files
+for (my $cl = 0; $cl < $clustnum; $cl++){
+    my $kc = 0;
+    open (TO, ">$outdir/$cl.fa");
+    foreach my $k (keys %$kclust){
+	$kc++;
+	my $c = $kclust->{$k};
+	if ($c == $cl){
+	    print TO ">$kc\n$k\n";
+	}
+	else{
+	    next;
+	}
+    }
+    close (TO);
+}
+
+# find out how many uniq kmers are in the core
+my $uniqcoreks = 0;
+open (CCL, "$outdir/$corecl.fa");
+my $uniqcoreks = 0;
+my $ksharedall = 0;
+while (my $line = <CCL>){
+    chomp $line;
+    if ($line =~m/^>.*/){
+	$uniqcoreks++;
+	next;
+    }
+    else{
+	my @gs = keys %{$kmers->{$line}};
+	my $gs = @gs;
+	($ksharedall++) if ($gs == $gcount);
+    }
+}
+
+my $fracuniq = $uniqcoreks / $uniqkmers;
+my $ksharedfrac = $ksharedall / $uniqkmers;
+print MAST "Core=$corecl\t$corem\t$cored\t$uniqcoreks\t$fracuniq\t$ksharedall\t$ksharedfrac\n";
+close (MAST);
+
+# exact match kmer clusters and paint regions using k.index
+
+# read k.index
+my $locations = {};
+open (OL, "$outdir/k.index");
+while (my $line = <OL>){
+    chomp $line;
+    my @line = split (/\t/, $line);
+    $locations->{$line[0]}->{$line[1]}->{$line[2]}->{$line[3]} = 1;
+}
+close (OL);
+
+# paint the genomes with cluster info
+#my $cpm = Parallel::ForkManager->new($procs);
+for (my $cl = 0; $cl < $clustnum; $cl++){
+#    $cpm->start and next;
+    print STDERR "Painting $cl\n";
+    
+    my $paint = {};
+    my $signal = 0;
+    open (F, "$outdir/$cl.fa");
+    while (my $line = <F>){
+	chomp $line;
+	if ($signal == 1){
+	    foreach my $g (keys %{$locations->{$line}}){
+		foreach my $c (keys %{$locations->{$line}->{$g}}){
+		    foreach my $y (keys %{$locations->{$line}->{$g}->{$c}}){
+			for my $x ($y .. $y + $kmer - 1){
+			    $paint->{$g}->{$c}->{$x}++;
+			}
+		    }
+		}
+	    }
+	    $signal = 0;
+	}
+	if ($line =~m/^>(.*)/){
+	    my $id = $1;
+	    $signal++;
+	}
+    }
+    close (F);
+
+    # paint
+    foreach my $g (sort keys %$tkmers){
+	print STDERR "Painting $g\n";
+	
+	open (PNT, ">$outdir/$cl.$g.paint");
+	open (DNS, ">$outdir/$cl.$g.density");
+	foreach my $c (sort keys %{$tkmers->{$g}}){
+
+	    my $counter = 0;
+	    my $mastercounter = 0;
+	    my $sum = 0;
+	    my $start = 1;
+	    for (my $x = 1; $x <= $tkmers->{$g}->{$c}; $x++){
+		
+		# density painting for circos
+		$counter++;
+		$mastercounter++;
+		if ($counter == $denslen){
+		    $sum += $paint->{$g}->{$c}->{$x};
+		    my $avg = $sum / $denslen;
+		    print DNS "$g\t$start\t$x\t$avg\n";
+
+		    $sum = 0;
+		    $counter = 0;
+		    $start = $x + 1;
+		}
+		elsif ($mastercounter == $tkmers->{$g}->{$c}){
+		    $sum += $paint->{$g}->{$c}->{$x};
+                    my $avg = $sum / $denslen;
+                    print DNS "$g\t$start\t$x\t$avg\n";
+
+                    $sum = 0;
+                    $counter = 0;
+                    $start = $x + 1;
+		}
+		else{
+		    $sum += $paint->{$g}->{$c}->{$x};
+		}
+		
+		# per residue painting
+		if (exists ($paint->{$g}->{$c}->{$x})){
+		    print PNT "$c\t$x\t$paint->{$g}->{$c}->{$x}\n";
+		    
+		}
+		else {
+		    print PNT "$c\t$x\t0\n";
+		}
+	    }
+	}
+	close (PNT);
+	close (DNS);
+
+	# generate circos plot for the genome/cluster pair
+	print STDERR "Circos $g\n";
+	
+	open (KAR, ">$outdir/$cl.$g.karyotype");
+	print KAR "chr - $g $g 1 $glens->{$g} gpos25\n";
+	close (KAR);
+	
+        open (CON, ">$outdir/$cl.$g.c_config");
+	my $maxrange = $kmer + 10;
+	print CON <<EOF;
+<colors>
+<<include etc/colors.conf>>
+</colors>
+
+<fonts>
+<<include etc/fonts.conf>>
+</fonts>
+
+<<include etc/housekeeping.conf>>
+
+<ideogram>
+<spacing>
+default = 0u
+break   = 0u
+</spacing>
+
+thickness         = 25p
+fill           = yes
+fill_color     = black
+
+radius         = 0.80r
+show_label     = yes
+label_font     = default
+label_radius   = dims(ideogram,radius) + 0.225r
+label_size     = 24p
+label_parallel = yes
+
+show_bands            = yes
+fill_bands            = yes
+band_stroke_thickness = 0
+band_stroke_color     = black
+band_transparency     = 4
+
+</ideogram>
+
+karyotype = $outdir/$cl.$g.karyotype
+
+<image>
+dir = $outdir
+file  = $cl.$g.png
+png = yes
+radius         = 2400p
+background     = white
+angle_offset   = -90
+24bit = yes
+auto_alpha_colors = yes
+auto_alpha_steps  = 5
+</image>
+
+<plots>
+<plot>
+show  = yes
+type = histogram
+file  = $outdir/$cl.$g.density
+color = black
+glyph = rectangle
+glyph_size = 8
+fill_color = black
+fill_under = yes
+thickness = 1
+min   = 0
+max   = $maxrange
+r0    = 1r
+r1    = 1.2r
+</plot>
+</plots>
+EOF
+         close (CON);
+	`circos -conf $outdir/$cl.$g.c_config`;
+	
+    }
+#    $cpm->finish;
+}
+#$cpm->wait_all_children;
+
+
+#####SUBS####
+    
+sub mi {
+    my $kmers = shift;
+    my $genomes = shift;
+    my $allkmers = shift;
+    my @genomes = @$genomes;
+    
+    # calculate contingency table p(genomes, kmers)
+    my $kconting = {};
+    my $kmarg = {};
+    my $gmarg = {};
+    foreach my $k (keys %$kmers){
+        foreach my $genome (@genomes){
+	    if ($kmers->{$k}->{$genome}){
+		$kconting->{$k}->{$genome} = $kmers->{$k}->{$genome} / $allkmers;
+		$kmarg->{$k} += $kmers->{$k}->{$genome} / $allkmers;
+		$gmarg->{$genome} += $kmers->{$k}->{$genome} / $allkmers;
+	    }
+	    else {
+		$kconting->{$k}->{$genome} = 0;
+		$kmarg->{$k} += 0;
+		$gmarg->{$genome} += 0;
+	    }
+	}
+    }
+    
+    # calculate the mi
+    my $mi = 0;
+    foreach my $k (keys %$kmers){
+	foreach my $genome (@genomes){
+	    next if ($kconting->{$k}->{$genome} == 0);
+	    $mi += $kconting->{$k}->{$genome} * log ($kconting->{$k}->{$genome} / ($kmarg->{$k} * $gmarg->{$genome}));
+	}
+    }
+    return ($mi);
+}
+
+
+sub ent {
+    my $dat = shift;
+    my $entropy = 0;
+    foreach my $d (@$dat){
+	next if ($d == 0);
+	$entropy += $d * log2($d);
+    }
+    return ($entropy * -1);
+}
+
+sub jsd {
+    my $data1 = shift;
+    my $data2 = shift;
+    my $freq1 = shift;
+    my $freq2 = shift;
+    my $count = shift;
+    
+    my $weight1 = $freq1 / ($freq1 + $freq2);
+    my $weight2 = $freq2 / ($freq1 + $freq2);
+    
+    my @js_left;
+    my $js_right = 0;
+    
+    my $counter = 0;
+    foreach my $d ($data1, $data2){
+	$counter++;
+	my $weight;
+	if ($counter == 1){
+	    $weight = $weight1;
+	}
+	else{
+	    $weight = $weight2;
+	}
+        $js_right += $weight * ent($d);
+        for (my $j = 0; $j < $count; $j++){
+            $js_left[$j] += $d->[$j] * $weight;
+        }
+    }
+
+    my $entjsleft = ent (\@js_left);
+    return ($entjsleft - $js_right);
+}
+       
+ 
+sub log2 {
+    my $n = shift;
+    return log($n)/log(2);
+}
+   
+sub log10 {
+    my $n = shift;
+    return log($n)/log(10);
+}

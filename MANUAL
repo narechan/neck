@@ -1,0 +1,176 @@
+Neck clusters k-mers using the sequential information bottleneck (IB).
+
+## QUICK START ##
+
+Run Neck from its Docker image:
+
+docker build -t neck-0.1 .
+docker run -it --mount src=`pwd`,target=/home/data,type=bind neck-0.1
+
+Run Neck on the toy data with the simulated HGT event provided 
+in the distribution:
+
+neck -i genomes/ -k 19 -m 1 -c 5 -n 4 -p 1 -l 200 -o output_directory
+
+## INTRODUCTION TO NECK ##
+
+Neck is a program that leverages lossy compression and clustering concepts 
+devised in information theory and natural language processing. Specifically, 
+neck uses the information bottleneck to cluster k-mers derived from a set of 
+input genomes. We have shown that these clusters illuminate both vertical 
+and horizontal evolutionary events. Importantly, neck can be used for evolutionary 
+studies despite being both alignment and tree free.
+
+Neck is written in PERL. All components are free and available through 
+the GNU GPL.
+
+## MAIN PROGRAMS ##
+
+neck is the main IB engine, and employs a particular variant called the 
+sequential information bottleneck.
+
+______ is used in the detection of horizontal gene transfer events.
+
+## INSTALLATION ##
+
+The neck algorithm is implemented in pure PERL, but the software requires 
+a number of PERL modules and uses Circos to visualize k-mer clusters.
+
+To install neck easily, use the dockerfile to create a docker image as 
+outlined in the quick start. This will provide a fully configured environment 
+with all the necessary software and dependencies including perl modules required 
+of both neck and circos.
+
+To install neck manually follow the procedure in the dockerfile, roughly:
+1. Circos
+   mkdir -p /home/software/circos
+   cd /home/software/circos
+   wget http://circos.ca/distribution/circos-0.69.tgz
+   tar xvfz circos-0.69.tgz
+   export PATH=/path/to/circos/circos-0.69/bin:$PATH
+2. Perl dependencies required of Circos: 
+   cpanm \
+       Carp \
+       Config::General \
+       Data::Dumper \
+       Digest::MD5 \
+       File::Basename \
+       File::Spec::Functions \
+       FindBin \
+       GD \
+       GD::Polyline \
+       Getopt::Long \
+       Graphics::ColorObject \
+       IO::File \
+       List::MoreUtils \
+       List::Util \
+       Math::Bezier \
+       Math::BigFloat \
+       Math::Round \
+       Math::VecStat \
+       Memoize \
+       POSIX \
+       Params::Validate \
+       Pod::Usage \
+       Readonly \
+       Regexp::Common \
+       Set::IntSpan \
+       Storable \
+       Time::HiRes \
+       Statistics::Basic \
+       Clone \
+       Font::TTF::Font \
+       SVG \
+       Text::Format
+3. Install neck
+   cpanm
+	Parallel::ForkManager \
+    	Statistics::Descriptive \
+	Getopt::Std
+   git clone https://github.com/narechan/neck.git /home/software/neck
+   export PATH=/path/to/neck:$PATH		    
+   
+## EXECUTING NECK ON THE TEST DATA ##
+
+The test data included with the distribution is intended to 
+recapitulate the result in Figure 2 of the paper. The data consists 
+of four simulated genomes with a single large horizontal gene transfer 
+event. The transfer event occurs in the common ancestor to genomes 0, 2, 
+and 3. The k-mer clusters capture the simulated event, it's ancestral state 
+in genome 1, and the core genome.
+
+neck -i genomes/ -k 19 -m 1 -c 5 -n 4 -p 1 -l 200 -o output_directory
+
+This command will generate multiple files that are detailed below in the 
+section on output. Most important are the circos images of the clusters 
+produced by the bottleneck procedure. They will highlight the transfer event.
+
+Details on options available to neck:
+	-i directory containing your genome fasta files (one genome per file) 
+	-o path to the output directory (will be created)
+	-k k-mer size
+	-m k-mer overlap. m=1 will use all overlapping k-mers. m=2 will sample 
+	   every other overlapping k-mer and so on.
+	-c the number of clusters to model during the bottleneck procedure
+	-n the number of iterations to run the bottleneck procedure
+	-p the number of processors to use in parallel. Note that these are 
+	   forks that parallelize just the creation of the circos images, one 
+	   fork per cluster modelled.
+	-l the length of the bin for the circos density plots.
+
+## OUTPUT ##
+
+Neck generates a lot of data:
+
+k.index is an index of all the k-mers sampled for the run. It contains the following
+fields: 1. k-mer, 2. Source genome name, 3. source genome index, 4. k-mer index
+
+Each cluster modeled during the bottleneck process has it's own fasta file of 
+constituent k-mers. For example, if the user asks for three clusters, the output will 
+contain 0.fa, 1.fa and 2.fa. These fasta files will contain all k-mers in the sample with 
+no overlaps. 
+
+To visualize these bottleneck derived k-mer clusters, neck maps each cluster's k-mers 
+against every input genome using circos. So if there were three genomes and three clusters 
+neck would produce 9 circos images and their associated data files:
+
+0.query1.*
+0.query2.*
+0.query3.*
+1.query1.*
+....
+
+The following files will be present for each combination:
+
+*.c_config -- a circos config file.
+*.karyotype -- a circos karyotype file based on the coordinates of the mapped genome
+*.density -- a density table with bins as defined by -l
+*.paint -- a file that shows the k-mer pileup for a given cluster to a given genome
+*.png -- a circos image file for the cluster/genome combination
+
+The stats.out file contains data useful for monitoring the progress 
+of the bottleneck run, data for characterizing the core genome, and data that 
+measures the compressibility of the dataset. The stat.out file contains
+the following:
+
+1. The number of unique kmers in the input genomes (uniqkmers).
+2. The mutual information between the unclustered k-mers and their 
+   source genomes (kMI).
+3. The entropy of all the k-mers (kEnt).
+4. The next few lines show the progress of the bottleneck clustering 
+   process. There is one line per iteration, each of which contain the
+   following fields:
+   a. iteration number
+   b. the mutual information between the k-mer clusters and source genomes
+      (clustMI). The number in parenthases is the normalized mutual information
+      with respect to kMI. 
+5. The final line provides information about the core genome. The fields 
+   are as follows:
+   a. the index number of the cluster which comprises the core
+   b. the average number of times a k-mer in the core cluster exists 
+      in each genome.
+   c. the standard deviation of b.
+   d. the number of unique k-mers in the core.
+   e. the fraction of all unique k-mers that are in the core.
+   f. the number of k-mers in the core that are shared by all the genomes.
+   g. the fraction of all unique k-mers shared by all the genomes.
