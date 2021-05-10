@@ -6,7 +6,7 @@ use Parallel::ForkManager;
 use strict;
 
 my %opts = ();
-getopts ('i:o:k:p:c:n:l:m:', \%opts);
+getopts ('i:o:k:p:c:n:l:m:r:', \%opts);
 my $indir  = $opts{'i'}; #directory of genomes; sequence should be on a single line
 my $outdir = $opts{'o'}; #directory with output of run
 my $kmer = $opts{'k'}; #kmer size
@@ -15,6 +15,7 @@ my $clustnum = $opts{'c'}; #number of clusters to model
 my $iterations = $opts{'n'}; #number of iterations of the sib clustering procedure
 my $procs = $opts{'p'}; #forks
 my $denslen = $opts{'l'}; #length of the bin for circos density plots
+my $rscript = $opts{'r'}; #path to the bcp R script
 
 `mkdir -p $outdir`;
 
@@ -129,12 +130,8 @@ my @ks = keys %$kmers;
 my $initkmi = mi ($fk2clust, \@ks, $allkmers);
 my $norminitkmi = $initkmi / $kent;
 
-<<<<<<< HEAD
 #print MAST "0\tclustMI=$initclustmi($norminitclustmi)\tkMI=$initkmi($norminitkmi)\n";
 print MAST "0\tclustMI=$initclustmi($norminitclustmi)\n";
-=======
-print MAST "0\tclustMI=$initclustmi($norminitclustmi)\tkMI=$initkmi($norminitkmi)\n";
->>>>>>> 3388d62adc3a8c01daca28fccdaad3b7c2ad48e8
 
 # short circuit variables
 my $maxloops = 1;
@@ -222,12 +219,8 @@ until ($maxloops > $iterations){
     my $kmi = mi ($fk2clust, \@ks, $allkmers); 
     my $normkmi = $kmi / $kent;
 
-<<<<<<< HEAD
 #    print MAST "$maxloops\tclustMI=$clustmi($normclustmi)\tkMI=$kmi($normkmi)\n";
     print MAST "$maxloops\tclustMI=$clustmi($normclustmi)\n";
-=======
-    print MAST "$maxloops\tclustMI=$clustmi($normclustmi)\tkMI=$kmi($normkmi)\n";
->>>>>>> 3388d62adc3a8c01daca28fccdaad3b7c2ad48e8
     $maxloops++;
 }
 
@@ -413,6 +406,11 @@ for (my $cl = 0; $cl < $clustnum; $cl++){
 	close (PNT);
 	close (DNS);
 
+        # run the bcp change detection algorithm for each genome/cluster pair
+        print STDERR "bcp $g\n";
+        `R --slave --args $outdir/$cl.$g.density $outdir/$cl.$g.bcp < $rscript`;
+        `mv Rplots.pdf $outdir/$cl.$g.bcp.Rplots.pdf`;
+
 	# generate circos plot for the genome/cluster pair
 	print STDERR "Circos $g\n";
 	
@@ -488,6 +486,23 @@ max   = $maxrange
 r0    = 1r
 r1    = 1.2r
 </plot>
+
+<plot>
+show  = yes
+type = histogram
+file  = $outdir/$cl.$g.bcp
+color = black
+glyph = rectangle
+glyph_size = 8
+fill_color = black
+fill_under = yes
+thickness = 1
+min   = 0
+max   = 1
+r0    = 1.2r
+r1    = 1.4r
+</plot>
+
 </plots>
 EOF
          close (CON);
