@@ -16,7 +16,13 @@ RUN apt-get update && \
     git \
     cpanminus \
     wget \
-    libgd2-xpm-dev
+    libgd2-xpm-dev \
+    r-base
+
+# install bayesian changepoint detection (bcp) R package and dependencies
+RUN R -e "install.packages(c('bcp'),
+                           dependencies=TRUE, 
+                           repos='http://cran.rstudio.com/')"
 
 # install circos
 RUN mkdir -p /home/software/circos \
