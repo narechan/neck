@@ -10,7 +10,7 @@ docker run -it --mount src=`pwd`,target=/home/data,type=bind neck-0.1
 Run Neck on the toy data with the simulated HGT event provided 
 in the distribution:
 
-neck -i genomes/ -k 19 -m 1 -c 5 -n 4 -p 1 -l 200 -o output_directory
+neck -i genomes/ -k 19 -m 1 -c 5 -n 4 -p 1 -l 200 -o output_directory -r /path/to/bcp.R
 
 ## INTRODUCTION TO NECK ##
 
@@ -29,12 +29,15 @@ the GNU GPL.
 neck is the main IB engine, and employs a particular variant called the 
 sequential information bottleneck.
 
-______ is used in the detection of horizontal gene transfer events.
+bcp.R employs bayesian changepoint detection to map boundaries of potential 
+horizontal gene transfer events.
 
 ## INSTALLATION ##
 
 The neck algorithm is implemented in pure PERL, but the software requires 
-a number of PERL modules and uses Circos to visualize k-mer clusters.
+a number of PERL modules and uses Circos to visualize k-mer clusters, and the bcp 
+package in R to detect changepoints in the k-mer spatial frequency distributions within 
+each cluster.
 
 To install neck easily, use the dockerfile to create a docker image as 
 outlined in the quick start. This will provide a fully configured environment 
@@ -82,6 +85,10 @@ To install neck manually follow the procedure in the dockerfile, roughly:
        Font::TTF::Font \
        SVG \
        Text::Format
+4. Install bcp
+   R -e "install.packages(c('bcp'), \
+                           dependencies=TRUE, \ 
+                           repos='http://cran.rstudio.com/')"
 3. Install neck
    cpanm
 	Parallel::ForkManager \
@@ -99,7 +106,7 @@ event. The transfer event occurs in the common ancestor to genomes 0, 2,
 and 3. The k-mer clusters capture the simulated event, it's ancestral state 
 in genome 1, and the core genome.
 
-neck -i genomes/ -k 19 -m 1 -c 5 -n 4 -p 1 -l 200 -o output_directory
+neck -i genomes/ -k 19 -m 1 -c 5 -n 4 -p 1 -l 200 -o output_directory -r /path/to/bcp.R
 
 This command will generate multiple files that are detailed below in the 
 section on output. Most important are the circos images of the clusters 
@@ -117,6 +124,7 @@ Details on options available to neck:
 	   forks that parallelize just the creation of the circos images, one 
 	   fork per cluster modelled.
 	-l the length of the bin for the circos density plots.
+	-r is the path to the included bcp.R script.
 
 ## OUTPUT ##
 
@@ -146,7 +154,11 @@ The following files will be present for each combination:
 *.karyotype -- a circos karyotype file based on the coordinates of the mapped genome
 *.density -- a density table with bins as defined by -l
 *.paint -- a file that shows the k-mer pileup for a given cluster to a given genome
-*.png -- a circos image file for the cluster/genome combination
+*.png -- a circos image file for the cluster/genome combination. This image will contain
+      two tracks. The innermost is the k-mer distribution and the outermost the 
+      bayesian changepoint probabilities.
+*.bcp -- a table of bayesian changepoint probabilities in bins defined by -l
+*.bcp.Rplots.pdf -- an R plot of the changepoint output
 
 The stats.out file contains data useful for monitoring the progress 
 of the bottleneck run, data for characterizing the core genome, and data that 
