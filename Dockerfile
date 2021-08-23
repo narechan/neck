@@ -20,8 +20,8 @@ RUN apt-get update && \
     r-base
 
 # install bayesian changepoint detection (bcp) R package and dependencies
-RUN R -e "install.packages(c('bcp'),
-                           dependencies=TRUE, 
+RUN R -e "install.packages(c('bcp'), \
+                           dependencies=TRUE, \ 
                            repos='http://cran.rstudio.com/')"
 
 # install circos
