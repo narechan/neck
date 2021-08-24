@@ -5,10 +5,11 @@
 ## find genomic topics (generally elements) in a set of assembled genomes.
 
 # the base image
-FROM ubuntu:14.04
+FROM ubuntu:20.04
 USER root
 
 # install base OS dependencies
+ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
     apt-get install -y \
     g++ \
@@ -16,7 +17,7 @@ RUN apt-get update && \
     git \
     cpanminus \
     wget \
-    libgd2-xpm-dev \
+    libgd-dev \
     r-base
 
 # install bayesian changepoint detection (bcp) R package and dependencies
