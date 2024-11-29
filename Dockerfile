@@ -33,7 +33,7 @@ RUN mkdir -p /home/software/circos \
   && wget --no-check-certificate https://circos.ca/distribution/circos-0.69-9.tgz \
   && tar xvfz circos-0.69-9.tgz
 
-ENV PATH /home/software/circos/circos-0.69/bin:$PATH
+ENV PATH /home/software/circos/circos-0.69-9/bin:$PATH
 
 RUN cpanm --force \
     Carp \
@@ -73,6 +73,8 @@ RUN cpanm --force \
 RUN cpanm \
     Parallel::ForkManager \
     Statistics::Descriptive \
+    Statistics::R \
+    Digest::MurmurHash3 \
     Getopt::Std
 
 # pull bottleneck code
