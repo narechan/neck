@@ -1,0 +1,429 @@
+#!/usr/bin/perl
+
+use Getopt::Std;
+use Statistics::Descriptive;
+use Parallel::ForkManager;
+use Statistics::R;
+use strict;
+
+# Function to print usage instructions
+sub print_usage {
+    print <<'USAGE';
+Usage: neck_paint -p <processors> -i <input_dir> -o <output_dir> -c <cluster_dir> -l <bin_length>
+                  -r <r_script_path> -m <max_range> -v <penalty_value> -x <regions_file>
+
+Required Arguments:
+  -p  Number of processors (positive integer)
+  -i  Input directory containing genomes
+  -o  Output directory for results
+  -c  Cluster directory with k-mer fastas
+  -l  Bin length for Circos density plots (positive integer)
+  -r  Path to the changepoint R script
+  -m  Maximum range for Circos plots (positive integer)
+  -v  Penalty value for changepoint PELT function or input "BIC" 
+
+Optional Arguments:
+  -x  Regions file, usually with known HGT regions (can be blank
+  -h  Display this help message
+USAGE
+exit;
+}
+
+# Parsing command-line options
+my %opts = ();
+getopts('p:i:o:c:l:r:m:v:x:h', \%opts);
+
+# Display help message if -h is provided
+print_usage() if $opts{'h'};
+
+# Assigning parameters
+my $procs     = $opts{'p'};
+my $indir     = $opts{'i'};
+my $outdir    = $opts{'o'};
+my $clustdir  = $opts{'c'};
+my $denslen   = $opts{'l'};
+my $rscript   = $opts{'r'};
+my $maxrange  = $opts{'m'};
+my $penvalue  = $opts{'v'};
+my $regions   = $opts{'x'};
+
+# Parameter validation
+unless ($outdir) {
+    print "Error: Input directory (-i) is required.\n";
+    print_usage();
+}
+unless ($clustdir) {
+    print "Error: Cluster directory (-c) is required.\n";
+    print_usage();
+}
+unless ($outdir) {
+    print "Error: Output directory (-o) is required.\n";
+    print_usage();
+}
+
+unless ($denslen && $denslen =~ /^\d+$/ && $denslen > 0) {
+    print "Error: Bin length (-l) must be a positive integer.\n";
+    print_usage();
+}
+
+unless ($procs && $procs =~ /^\d+$/ && $procs > 0) {
+    print "Error: Number of processors (-p) must be a positive integer.\n";
+    print_usage();
+}
+
+unless ($maxrange && $maxrange =~ /^\d+$/ && $maxrange > 0){
+    print "Error: Max range (-m) must be a positive integer.\n";
+    print_usage();
+}
+
+unless ($penvalue) {
+    print "Error: Penalty value (-v) must be a positive integer or BIC.\n";
+    print_usage();
+}
+
+unless ($rscript) {
+    print "Error: R script (-r) must be a valid file path.\n";
+    print_usage();
+}
+
+`mkdir -p $outdir`;
+
+# reference processing
+opendir (R, "$indir");
+my @refs = sort (readdir (R));
+shift @refs;
+shift @refs;
+closedir (R);
+
+my $tkmers = {};
+foreach my $ref_name (@refs){
+    my $id;
+    my $seq;
+    open (G, "$indir/$ref_name");
+    while (my $line = <G>){
+        chomp $line;
+        if ($line =~m/^>(.*)/){
+            $id = $1;
+        }
+        else{
+            $seq = $line;
+            my $len = length ($seq);
+            $tkmers->{$ref_name} = $len;
+        }
+    }
+    close (G);
+
+    `bowtie2-build $indir/$ref_name $outdir/$ref_name`;
+}
+
+# kmer cluster processing
+opendir (D, "$clustdir");
+my @clustfastas = sort (readdir (D));
+shift @clustfastas;
+shift @clustfastas;
+closedir (D);
+
+# hgt detection and character compression
+my $pm = Parallel::ForkManager->new($procs);
+foreach my $clustfile (@clustfastas){
+    foreach my $reffile (@refs){
+	$pm->start and next;
+
+        # map kmers to the genome
+	print STDERR "map $reffile-$clustfile\n";
+	`bowtie2 -a -f -x $outdir/$reffile -U $clustdir/$clustfile | samtools view -bS - | samtools sort - -T aln -o $outdir/$reffile-$clustfile.bam`;
+
+        # calculate per position depth
+	print STDERR "map $reffile-$clustfile\n";
+	`samtools depth -a $outdir/$reffile-$clustfile.bam > $outdir/$reffile-$clustfile.depth`;
+
+	# find depth per known region if regions file supplied
+	if ($regions){
+	    print STDERR "regions clustfile\n";
+	    my $deep = {};
+	    open (D, "$outdir/$reffile-$clustfile.depth");
+	    my $poscount = 0;
+	    my $tdepth   = 0;
+	    while (my $line = <D>){
+		chomp $line;
+		my ($contig, $pos, $dep) = split (/\t/, $line);
+		$poscount++;
+		$tdepth += $dep;
+
+		my $signal = 0;
+		open (R, "$regions");
+		while (my $line = <R>){
+		    chomp $line;
+		    next if ($line =~m/^Start/);
+		    my ($start, $end) = split (/\t/, $line);
+		    my $rstring = $start . "-" . $end;
+		    my $len = $end - $start + 1;
+		    if (($pos >= $start) and ($pos <= $end)){ #some pos can go into mult ranges
+			push (@{$deep->{$rstring}}, $dep);
+			$signal++;
+		    }
+		    else{
+			next;
+		    }
+		}
+		close (R);
+		(push (@{$deep->{"CORE"}}, $dep)) if ($signal == 0);
+	    }
+	    my $avgdepth = $tdepth / $poscount;
+	    close (D);
+
+	    my $regtally = {};
+	    open (R, ">$outdir/$reffile-$clustfile.regions");
+	    open (RC, ">$outdir/$reffile-$clustfile.regions_stats");
+	    foreach my $region (sort keys %$deep){
+		next if ($region eq "CORE");
+		my ($start, $end) = split (/\-/, $region);
+
+		print R "$reffile\t$start\t$end\n";
+
+		my $len = $end - $start + 1;
+		my $sum = 0;
+		foreach my $p (@{$deep->{$region}}){
+		    $sum += $p;
+		}
+		my $regavg = $sum / $len;
+		
+		my $R = Statistics::R->new();
+		$R->set('rin', \@{$deep->{$region}});
+		$R->set('rout', \@{$deep->{"CORE"}});
+		$R->run(q`pval<-wilcox.test(rin,rout)$p.value`);
+		my $pvalue = $R->get('pval');
+		if ($pvalue <= 0.01){
+		    print RC "$start\t$end\t$regavg\t$pvalue\tDETECTED\n";
+		}
+		else{
+		    print RC "$start\t$end\t$regavg\t$pvalue\tNOT_DETECTED\n";
+		}
+	    }
+	    print RC "AVG_TOTAL_DEPTH=$avgdepth\n";
+	    close (RC);
+	    close (R);
+	}
+	
+        # change detection directly on depth
+	print STDERR "changepoints $reffile-$clustfile\n";
+	`R --slave --args $outdir/$reffile-$clustfile.depth $penvalue < $rscript > $outdir/$reffile-$clustfile.chpts`;
+
+        # store changepoints
+	my @chpts;
+	my @dchpts;
+	open (CH, "$outdir/$reffile-$clustfile.chpts");
+	while (my $line = <CH>){
+	    chomp $line;
+	    my @pts = split (/\s/, $line);
+	    foreach my $p (@pts){
+		push (@chpts, $p);
+		push (@dchpts, $p);
+	    }
+	}
+	push (@chpts, $tkmers->{$reffile});
+	push (@dchpts, $tkmers->{$reffile});
+	close (CH);
+	
+        # get depth stats for the changepoints
+	# assume first changepoint is the start of the first event
+	my $chunkintervals = {};
+	my $chunkdepth = {};
+	my $depth = {};
+	open (D, "$outdir/$reffile-$clustfile.depth");
+	my $runningdepth = 0;
+	my $counter = 0;
+	my $flicker = 0;
+	my $stint = 0;
+	my $endint = 0;
+	while (my $line = <D>){
+	    chomp $line;
+
+	    my ($contig, $pos, $d) = split (/\t/, $line);
+	    $depth->{$pos} = $d;
+
+	    if ($pos == $chpts[0]){
+		$counter++;
+		$flicker++;
+		$chunkdepth->{$pos} = $runningdepth / $counter;
+		if ($flicker == 1){
+		    $stint = $pos;
+		}
+		elsif ($flicker == 2){
+		    $endint = $pos;
+		    my $interval = $stint . "-" . $endint;
+		    $chunkintervals->{$interval} = $runningdepth / $counter;
+		    $flicker = 0;
+		}
+		else{
+		    next;
+		}
+		$runningdepth = 0;
+                $counter = 0;
+		shift (@chpts);
+	    }
+	    else{
+		$runningdepth += $d;
+		$counter++;
+	    }
+	}
+	close (D);
+
+        # print depth stats for the changepoints
+	open (CD, ">$outdir/$reffile-$clustfile.chunks");
+	foreach my $pt (sort {$a <=> $b} keys %$chunkdepth){
+	    print CD "$pt\t$chunkdepth->{$pt}\n";
+	}
+	close (CD);
+
+	# print intervals
+	open (IN, ">$outdir/$reffile-$clustfile.intervals");
+	foreach my $int (sort keys %$chunkintervals){
+            print IN "$int\t$chunkintervals->{$int}\n";
+        }
+        close (IN);
+
+	#visualize with circos
+	print STDERR "Painting $reffile-$clustfile\n";
+
+	open (DNS, ">$outdir/$reffile-$clustfile.density");
+	my $counternew = 0;
+	my $sum = 0;
+	my $start = 1;
+	for (my $x = 1; $x <= $tkmers->{$reffile}; $x++){
+
+	    # density painting for circos
+	    $counternew++;
+	    if (($counternew == $denslen) or ($counternew == $tkmers->{$reffile})){
+		$sum += $depth->{$x};
+		my $avg = $sum / $denslen;
+		print DNS "$reffile\t$start\t$x\t$avg\n";
+
+		$sum = 0;
+		$counternew = 0;
+		$start = $x + 1;
+	    }
+	    else{
+		$sum += $depth->{$x};
+	    }
+	}
+	close (DNS);
+
+	open (OU, ">$outdir/$reffile-$clustfile.chpts.draw");
+	foreach my $pt (@dchpts){
+	    my $mi = $pt - 500;
+	    my $ma = $pt + 500;
+	    if ($mi < 1){
+		$mi = 1;
+	    }
+	    if ($ma > $tkmers->{$reffile}){
+		$ma = $tkmers->{$reffile};
+	    }
+	    print OU "$reffile\t$mi\t$ma\t$maxrange\n";
+	}
+	close (OU);
+
+        # generate circos plot for the genome/cluster pair
+	print STDERR "Circos $reffile-$clustfile\n";
+	
+	open (KAR, ">$outdir/$reffile-$clustfile.karyotype");
+	print KAR "chr - $reffile $reffile 1 $tkmers->{$reffile} gpos25\n";
+	close (KAR);
+	
+	open (CON, ">$outdir/$reffile-$clustfile.c_config");
+	print CON <<EOF;
+<colors>
+<<include etc/colors.conf>>
+</colors>
+<fonts>
+<<include etc/fonts.conf>>
+</fonts>
+<<include etc/housekeeping.conf>>
+<ideogram>
+<spacing>
+default = 0u
+break   = 0u
+</spacing>
+thickness         = 25p
+fill           = yes
+fill_color     = black
+radius         = 0.80r
+show_label     = yes
+label_font     = default
+label_radius   = dims(ideogram,radius) + 0.225r
+label_size     = 24p
+label_parallel = yes
+show_bands            = yes
+fill_bands            = yes
+band_stroke_thickness = 0
+band_stroke_color     = black
+band_transparency     = 4
+</ideogram>
+karyotype = $outdir/$reffile-$clustfile.karyotype
+<image>
+dir = $outdir
+file  = $reffile-$clustfile.png
+png = yes
+radius         = 2400p
+background     = white
+angle_offset   = -90
+24bit = yes
+auto_alpha_colors = yes
+auto_alpha_steps  = 5
+</image>
+<plots>
+<plot>
+show  = yes
+type = histogram
+file  = $outdir/$reffile-$clustfile.density
+color = black
+glyph = rectangle
+glyph_size = 8
+fill_color = black
+fill_under = yes
+thickness = 1
+min   = 0
+max   = $maxrange
+r0    = 1r
+r1    = 1.2r
+</plot>
+
+<plot>
+show  = yes
+type = highlight
+file  = $outdir/$reffile-$clustfile.chpts.draw
+color = red
+glyph = rectangle
+glyph_size = 80
+fill_color = red
+fill_under = yes
+thickness = 100
+min   = 0
+max   = $maxrange
+r0    = 0.9r
+r1    = 0.95r
+</plot>
+
+</plots>
+EOF
+close (CON);
+	if ($regions){
+            open (CC, ">>$outdir/$reffile-$clustfile.c_config");
+            print CC <<EOFF;
+<highlights>
+<highlight>
+file = $outdir/$reffile-$clustfile.regions
+fill_color = black
+r0         = 0.8r
+r1         = 0.85r
+stroke_thickness = 1
+</highlight>
+</highlights>
+EOFF
+close (CC);
+        }
+	`circos -conf $outdir/$reffile-$clustfile.c_config`;
+	$pm->finish;
+    }
+}
+$pm->wait_all_children;

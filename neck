@@ -1,0 +1,486 @@
+#!/usr/bin/perl
+
+use Getopt::Std;
+use Statistics::Descriptive;
+use Digest::MurmurHash3 qw( murmur128_x64 );
+use strict;
+
+# Display usage/help information
+sub print_usage {
+    print <<"END_USAGE";
+Usage: $0 -i <input_directory> -o <output_directory> -k <kmer_size> -c <num_clusters> -n <num_iterations> -s <sketch_rate>
+
+    -i <input_directory>   Directory of genomes (sequences should be on a single line)
+    -o <output_directory>  Directory for output of the run
+    -k <kmer_size>         Size of the k-mers
+    -c <num_clusters>      Number of clusters to model
+    -n <num_iterations>    Number of iterations for clustering procedure
+    -s <sketch_rate>       Sketch rate
+
+Example:
+    $0 -i genomes/ -k 19 -c 2 -n 5 -s 10 -o temp
+
+END_USAGE
+exit;
+}
+
+my %opts = ();
+getopts ('i:o:k:c:n:s:h', \%opts);
+
+# If -h is provided, print usage and exit
+if ($opts{'h'}) {
+    print_usage();
+}
+
+# assign
+my $indir  = $opts{'i'}; #directory of genomes; sequence should be on a single line
+my $outdir = $opts{'o'}; #directory with output of run
+my $kmer = $opts{'k'}; #kmer size
+my $clustnum = $opts{'c'}; #number of clusters to model
+my $iterations = $opts{'n'}; #number of iterations of the sib clustering procedure
+my $number = $opts{'s'}; #sketch rate
+
+unless ($indir){
+    print "Error: Input directory (-i) is required.\n";
+    print_usage();
+}
+unless ($outdir){
+    print "Error: Output directory (-o) is required.\n";
+    print_usage();
+}
+unless ($kmer && $kmer =~ /^\d+$/ && $kmer > 0){
+    print "Error: K-mer size (-k) must be a positive integer.\n";
+    print_usage();
+}
+unless ($clustnum && $clustnum =~ /^\d+$/ && $clustnum > 0){
+    print "Error: Number of clusters (-n) must be a positive integer.\n";
+    print_usage();
+}
+unless ($iterations && $iterations =~ /^\d+$/ && $iterations > 0){
+    print "Error: Number of iterations (-n) must be a positive integer.\n";
+    print_usage();
+}
+unless ($number && $number =~ /^\d+$/ && $number > 0){
+    print "Error: Sketch rate (-s) must be a positive integer.\n";
+    print_usage();
+}
+
+`mkdir -p $outdir/clusters`;
+`mkdir -p $outdir/hashes`;
+`mkdir -p $outdir/tfreqs`;
+`mkdir -p $outdir/core`;
+
+# genomes
+opendir (D, "$indir");
+my @genomes = sort (readdir (D));
+shift @genomes;
+shift @genomes;
+closedir (D);
+my $gcount = @genomes;
+
+# sampling rate
+my $maxhash = 2**64;
+my $thresh  = $maxhash / $number;
+
+# kmer counting
+my $kindex = {};
+my $ktax = {};
+foreach my $genome (@genomes){
+    print STDERR "Counting $genome\n";
+    my $id;
+    my $seq;
+    my $len;
+    open (KH, ">$outdir/hashes/$genome.hashes");
+    open (FASTA, "$indir/$genome");
+    while (my $line =<FASTA>){
+	if ($line =~m/^>(.*)/){
+	    $id = $1;
+	}
+	else{
+	    my $seqa = $line;
+            $seq     = uc($seqa);
+
+            my $cnter = 1;
+            while (length $seq >= $kmer){
+                my $ffrag = substr $seq, 0, $kmer;
+
+                # disallow any string with unknown bases
+                if ($ffrag =~m/[BDEFHIJKLMNOPQRSUVWXYZ]/i){
+                    substr $seq, 0, 1, '';
+                    $cnter += 1;
+                }
+                else{
+		    my $hash = murmur128_x64 ($ffrag, 460);
+		    if ($hash < $thresh){
+			print KH "$hash\n";
+			$kindex->{$hash} = $ffrag;
+			$ktax->{$hash}->{$genome}++;
+		    }
+		    substr $seq, 0, 1, '';
+		    $cnter += 1;
+		}
+	    }
+	    
+	}
+    }
+    close (FASTA);
+    close (KH);
+}
+
+# collate hashes
+my $kmers = {};
+my $allkmers = 0;
+my $kmersperg = {};
+my $fkmers = {};
+foreach my $g (@genomes){
+    print STDERR "Collating hashes for $g\n";
+    open (H, "$outdir/hashes/$g.hashes");
+    while (my $h = <H>){
+        chomp $h;
+        $kmers->{$h}->{$g}++;
+	$fkmers->{$h}++;
+        $kmersperg->{$g}++;
+        $allkmers++;
+    }
+    close (H);
+}
+
+open (MAST, ">$outdir/stats.out");
+my $uniqkmers = keys %$kmers;
+print MAST "uniqkmers=$uniqkmers\n";
+
+# entropy of all the kmers
+my @allkfreqs;
+foreach my $k (keys %$fkmers){
+    push (@allkfreqs, $fkmers->{$k} / $allkmers);
+}
+my $kent = ent (\@allkfreqs);
+
+
+###SIB###
+
+# get MI of the raw data (I(X|Y))
+my $minfo = mi ($kmers, \@genomes, $allkmers);
+print MAST "kMI=$minfo\n";
+
+# print entropy of the kmers (H(X))
+print MAST "kEnt=$kent\n";
+
+# inititalize a random set of clusters
+my $kclust = {};
+my $kit = {};
+my $fkclust = {}; #for genomes
+my $fk2clust = {};#for kmers
+my $ckclust = {};
+foreach my $k (keys %$kmers){
+    my $index = int(rand($clustnum));
+    $kclust->{$k} = $index;
+    $kit->{$index} = 1;
+    my $counter = -1;
+    foreach my $genome (@genomes){
+	$counter++;
+	$fkclust->{$index}->{$genome} += $kmers->{$k}->{$genome};
+	$fk2clust->{$index}->{$k} += $kmers->{$k}->{$genome}; #too much memory?
+	$ckclust->{$index} += $kmers->{$k}->{$genome};
+    }
+}
+
+# output initial distributions
+foreach my $c (sort {$a <=> $b} keys %$fkclust){
+    print STDERR "CLUST$c\t";
+    my @str;
+    my @gens;
+    foreach my $g (@genomes){
+	push (@str, $fkclust->{$c}->{$g});
+	push (@gens, $g);
+    }
+    my $str = join "\t", @str;
+    my $gens = join "\t", @gens;
+    print STDERR "$gens\n";
+    print STDERR "$str\n";
+}
+
+# init cluster MI
+my $initclustmi = mi ($fkclust, \@genomes, $allkmers);
+my $norminitclustmi = $initclustmi / $minfo;
+
+# init k MI (compression MI) (I(T|X))
+my @ks = keys %$kmers;
+my $initkmi = mi ($fk2clust, \@ks, $allkmers);
+my $norminitkmi = $initkmi / $kent;
+
+print MAST "0\tclustMI=$initclustmi($norminitclustmi)\n";
+
+# short circuit variables
+my $maxloops = 1;
+
+# short circuit loop
+my $lastnmi;
+until ($maxloops > $iterations){
+    print STDERR "loop $maxloops\n";
+
+    # kmer loop against all clusters
+    foreach my $k (keys %$kmers){
+
+	# build kmer freqs for JSD
+	my @kfreqs;
+	foreach my $genome (@genomes){
+	    push (@kfreqs, $kmers->{$k}->{$genome} / $fkmers->{$k});
+	}
+
+	my $dmin = 1e6;
+	my $selectclust;
+	my $origclust = $kclust->{$k};
+	
+	foreach my $c (sort {$a <=> $b} keys %$kit){
+	    
+	    # check to see if the cluster has been purged
+	    if ($ckclust->{$c} == 0){
+		next;
+	    }
+
+	    # build cluster freqs for JSD
+	    my @temparray;
+	    foreach my $genome (@genomes){
+		push (@temparray, $fkclust->{$c}->{$genome} / $ckclust->{$c});
+	    }
+	    
+	    # build the weights
+	    my $clustfreq = $ckclust->{$c} / $uniqkmers;
+	    my $kfreq     = $fkmers->{$k} / $uniqkmers;
+	    
+	    # calculate divergence and update min
+	    my $jsd = jsd (\@kfreqs, \@temparray, $kfreq, $clustfreq, $gcount);
+	    my $div = ($kfreq + $clustfreq) * $jsd;
+	    if ($div < $dmin){
+		$dmin = $div;
+		$selectclust = $c;
+	    }
+	    else{
+		next;
+	    }
+	}
+	
+	# move kmer and update vars if its min cluster is different than current
+	if ($selectclust != $origclust){
+	    foreach my $g (@genomes){
+		$fkclust->{$origclust}->{$g} -= $kmers->{$k}->{$g};
+                $fkclust->{$selectclust}->{$g} += $kmers->{$k}->{$g};
+		$fk2clust->{$origclust}->{$k} -= $kmers->{$k}->{$g};
+                $fk2clust->{$selectclust}->{$k} += $kmers->{$k}->{$g};
+		$ckclust->{$origclust} -= $kmers->{$k}->{$g};
+		$ckclust->{$selectclust} += $kmers->{$k}->{$g};
+	    }
+	    $kclust->{$k} = $selectclust;
+	}
+	else{
+	    next;
+	}
+    }
+    
+    # print state of dists
+    foreach my $c (sort {$a <=> $b} keys %$fkclust){
+	print STDERR "CLUST$c\t";
+	my @str;
+	foreach my $g (@genomes){
+	    push (@str, $fkclust->{$c}->{$g});
+	}
+	my $str = join "\t", @str;
+	print STDERR "$str\n";
+    }
+    
+    # calculate clust MI (I(T|Y))
+    my $clustmi = mi ($fkclust, \@genomes, $allkmers);
+    my $normclustmi = $clustmi / $minfo;
+
+    # calculate k MI (compression MI) (I(T|X))
+    my @ks = keys %$kmers;
+    my $kmi = mi ($fk2clust, \@ks, $allkmers); 
+    my $normkmi = $kmi / $kent;
+
+    print MAST "$maxloops\tclustMI=$clustmi($normclustmi)\n";
+    $maxloops++;
+    ($lastnmi = $normclustmi) if ($maxloops == $iterations+1);
+}
+
+# find the core cluster: the cluster with the highest mean
+# and lowest variance by rank
+print STDERR "Finding the core\n";
+open (MV, ">$outdir/cluster.stats");
+foreach my $c (sort {$a <=> $b} keys %$fkclust){
+    my @str;
+    foreach my $g (@genomes){
+	push (@str, $fkclust->{$c}->{$g});
+    }
+    my $statobj = Statistics::Descriptive::Full->new();
+    $statobj->add_data(@str);
+    my $mean  = $statobj->mean();
+    
+    # don't consider this cluster if it's all zeros
+    next if ($mean == 0);
+
+    my $variance = $statobj->variance();
+    my $std = $statobj->standard_deviation();
+    my $cv = $std / $mean;
+    my $dispersion = $variance / $mean;
+
+    print MV "$c\t$mean\t$variance\t$dispersion\t$cv\n";
+}
+close (MV);
+
+`sort -rn -k2 $outdir/cluster.stats > $outdir/cluster.stats.srt`;
+
+open my $file, '<', "$outdir/cluster.stats.srt"; 
+my $firstLine = <$file>;
+chomp $firstLine; 
+my ($corecluster, $coremean, $corevariance, $coredisp, $corecv) = split (/\t/, $firstLine);
+close $file;
+
+# print out the kmer cluster fasta files
+for (my $cl = 0; $cl < $clustnum; $cl++){
+    my $kc = 0;
+    my $tcounter = {};
+    open (TO, ">$outdir/clusters/$cl.fa");
+    foreach my $k (keys %$kclust){
+	$kc++;
+	my $c = $kclust->{$k};
+	if ($c == $cl){
+	    my @defline;
+	    foreach my $g (sort keys %{$ktax->{$k}}){
+		$tcounter->{$g} += $ktax->{$k}->{$g};
+		my $st = $g . "[" . $ktax->{$k}->{$g} . "]";
+		push (@defline, $st);
+	    }
+	    my $defline = join ":", @defline;
+	    print TO ">$kc\t$defline\n$kindex->{$k}\n";
+	}
+	else{
+	    next;
+	}
+    }
+    close (TO);
+    open (TSUM, ">$outdir/tfreqs/$cl.tfreq");
+    foreach my $gen (sort keys %$tcounter){
+	print TSUM "$gen\t$tcounter->{$gen}\n";
+    }
+    close (TSUM);
+}
+
+`cp $outdir/clusters/$corecluster.fa $outdir/core`;
+
+# find out how many uniq kmers are in the core
+my $uniqcoreks = 0;
+open (CCL, "$outdir/core/$corecluster.fa");
+my $uniqcoreks = 0;
+my $ksharedall = 0;
+while (my $line = <CCL>){
+    chomp $line;
+    if ($line =~m/^>.*/){
+	$uniqcoreks++;
+	next;
+    }
+    else{
+	my @gs = keys %{$kmers->{$line}};
+	my $gs = @gs;
+	($ksharedall++) if ($gs == $gcount);
+    }
+}
+
+my $fracuniq = $uniqcoreks / $uniqkmers;
+my $ksharedfrac = $ksharedall / $uniqkmers;
+print MAST "NMI=$lastnmi\n";
+print MAST "Core=$corecluster\t$coremean\t$corecv\t$uniqcoreks\t$fracuniq\t$ksharedall\t$ksharedfrac\n";
+close (MAST);
+
+#####SUBS####
+    
+sub mi {
+    my $kmers = shift;
+    my $genomes = shift;
+    my $allkmers = shift;
+    my @genomes = @$genomes;
+    
+    # calculate contingency table p(genomes, kmers)
+    my $kconting = {};
+    my $kmarg = {};
+    my $gmarg = {};
+    foreach my $k (keys %$kmers){
+        foreach my $genome (@genomes){
+	    if ($kmers->{$k}->{$genome}){
+		$kconting->{$k}->{$genome} = $kmers->{$k}->{$genome} / $allkmers;
+		$kmarg->{$k} += $kmers->{$k}->{$genome} / $allkmers;
+		$gmarg->{$genome} += $kmers->{$k}->{$genome} / $allkmers;
+	    }
+	    else {
+		$kconting->{$k}->{$genome} = 0;
+		$kmarg->{$k} += 0;
+		$gmarg->{$genome} += 0;
+	    }
+	}
+    }
+    
+    # calculate the mi
+    my $mi = 0;
+    foreach my $k (keys %$kmers){
+	foreach my $genome (@genomes){
+	    next if ($kconting->{$k}->{$genome} == 0);
+	    $mi += $kconting->{$k}->{$genome} * log ($kconting->{$k}->{$genome} / ($kmarg->{$k} * $gmarg->{$genome}));
+	}
+    }
+    return ($mi);
+}
+
+
+sub ent {
+    my $dat = shift;
+    my $entropy = 0;
+    foreach my $d (@$dat){
+	next if ($d == 0);
+	$entropy += $d * log2($d);
+    }
+    return ($entropy * -1);
+}
+
+sub jsd {
+    my $data1 = shift;
+    my $data2 = shift;
+    my $freq1 = shift;
+    my $freq2 = shift;
+    my $count = shift;
+    
+    my $weight1 = $freq1 / ($freq1 + $freq2);
+    my $weight2 = $freq2 / ($freq1 + $freq2);
+    
+    my @js_left;
+    my $js_right = 0;
+    
+    my $counter = 0;
+    foreach my $d ($data1, $data2){
+	$counter++;
+	my $weight;
+	if ($counter == 1){
+	    $weight = $weight1;
+	}
+	else{
+	    $weight = $weight2;
+	}
+        $js_right += $weight * ent($d);
+        for (my $j = 0; $j < $count; $j++){
+            $js_left[$j] += $d->[$j] * $weight;
+        }
+    }
+
+    my $entjsleft = ent (\@js_left);
+    return ($entjsleft - $js_right);
+}
+       
+ 
+sub log2 {
+    my $n = shift;
+    return log($n)/log(2);
+}
+   
+sub log10 {
+    my $n = shift;
+    return log($n)/log(10);
+}

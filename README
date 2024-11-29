@@ -1,0 +1,5 @@
+Welcome to neck. Neck clusters k-mers in a set of genomes using 
+the information bottleneck. It is an alignment and tree free method 
+to detect both vertical and horitzontal evolutionary signal.
+
+This repository contains software subject to CC-BY-NC.
